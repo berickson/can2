@@ -1,0 +1,10 @@
+# Host-specific, generated from docker/.env.example
+docker/.env
+
+# Claude Code local session config (machine-specific, not project source)
+.claude/settings.local.json
+
+# colcon build artifacts
+white_crash_ws/build/
+white_crash_ws/install/
+white_crash_ws/log/
