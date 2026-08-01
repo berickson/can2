@@ -71,8 +71,10 @@ Both containers running and verified talking to each other over real ROS2 topics
   hidden wheels per side) with aggressive friction/drive-gain randomization, relying on
   RMA online adaptation to close the tracked-vs-wheeled gap rather than modeling tracks
   faithfully.
-- Isaac Lab (RMA/BC training tooling) — not needed yet, revisit once past scene
-  authoring.
+- **Isaac Lab / RL practice project underway** — see `training/PLAN.md`. PID vs.
+  learned policy for speed control + approach-and-stop, using white-crash's real
+  sensor suite (encoders, 3x fan-arranged lidar, IMU, voltage). This is where Isaac
+  Lab actually gets adopted, ahead of the main scene-authoring work above.
 - Lyrical container is on the official `ros:lyrical-ros-base-resolute` image.
 
 ## Reference
