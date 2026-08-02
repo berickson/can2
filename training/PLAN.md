@@ -205,31 +205,39 @@ the 10Hz telemetry rate):
   recurrent cell (GRU/LSTM, still tiny, still ESP32-feasible) — not decided, see open
   questions.
 
-**Action space**: two continuous outputs per wheel, not one — `drive ∈ [-1, 1]`
-(signed rate, forward positive/reverse negative → `go(drive)`) and
-`brake ∈ [0, 1]` (→ `brake(brake)`; per the actual driver code `brake(0)` already *is*
-coast, so no separate coast output is needed). Combination rule: `brake > 0` →
-use `brake()` and ignore `drive`; otherwise use `go(drive)`. Four outputs total
-(`left_drive`, `left_brake`, `right_drive`, `right_brake`).
+**Action space (revised 2026-08-02)**: two continuous outputs per wheel —
+`throttle_percent ∈ [-1, 1]` (signed rate, forward positive/reverse negative — same
+role as `go()`'s `rate`) and `drag_brake_percent ∈ [0, 1]` (same role as `brake()`'s
+`intensity`). Four outputs total (`left_throttle_percent`, `left_drag_brake_percent`,
+`right_throttle_percent`, `right_drag_brake_percent`).
 
-Two outputs instead of one per wheel because drive and brake are physically distinct
-H-bridge pin states, not two ends of one dial — can't blend them within a single PWM
-cycle, so cramming both into one axis just means picking arbitrary breakpoints for the
-network to fight against. Reverse is included (not just forward-to-coast) because the
-action *interface* is expensive to change later even though task complexity is cheap
-to stage — e.g. overshoot recovery will need it soon regardless of whether the first
-training curriculum exercises it much.
+**Not mutually exclusive — the two are blended, matching Traxxas-style drag brake
+generalized to any throttle level.** Superseded the earlier "brake takes precedence,
+ignore drive" rule (which treated drive/brake as mutually-exclusive pin states you
+can't blend within a PWM cycle). They can be blended: the real H-bridge can time-share
+its PWM period between the drive pin-state and the brake (both-pins-shorted) pin-state,
+the same mechanism `brake(intensity)` already uses to blend coast↔full-brake — just
+generalized so the "coast" fraction of the period can instead be actively driving.
+Firmware doesn't implement that time-sharing yet (`go()`/`brake()` are still mutually
+exclusive there); this is now a real prerequisite for sim-to-real transfer, not just a
+training nicety. Implemented in `training/motor_model.py`:
+`a = (1 - drag_brake_percent) * accel_from_throttle(throttle_percent, v) +
+drag_brake_percent * accel_from_brake(v)`. A small training penalty (shaped as
+`k * |throttle_percent| * drag_brake_percent`, zero unless both are actually in use
+together) discourages gratuitous overlap without forbidding it outright — continuous
+and gradient-friendly rather than a hard branch.
 
-**Known training gotcha, and the fix**: whenever `brake > 0`, `drive` has zero effect
-on the environment that step, so it gets no gradient signal and can drift to arbitrary
-values while unused ("windup") — then snaps to whatever it wandered to the instant
-`brake` returns to 0, right at the moment (transitioning out of braking) where a jarring
-action is least wanted. Fix: a small auxiliary loss, active whenever braking, penalizing
-`drive` for implying a target speed above the current actual speed (you shouldn't be
-asking to go faster than you're currently going while you're supposed to be slowing
-down). Simple v1 — can get more sophisticated (e.g. penalize deviation from the
-motor-model-implied steady-state-for-current-v value instead of raw current speed) if
-the simple version isn't enough once training actually starts.
+Reverse is included (not just forward-to-coast) because the action *interface* is
+expensive to change later even though task complexity is cheap to stage — e.g.
+overshoot recovery will need it soon regardless of whether the first training
+curriculum exercises it much.
+
+**Windup gotcha from the old design is now moot.** The old "brake takes precedence"
+rule meant `drive` got zero gradient whenever `brake > 0` (windup, then a jarring snap
+back on brake release) — the reason for the auxiliary anti-windup loss described in an
+earlier version of this doc. Under the blended action space, throttle always
+contributes via its `(1 - drag_brake_percent)` weight, so it always has a live gradient
+path; the auxiliary loss is no longer needed.
 
 ## Firmware audit findings (2026-08-01)
 
