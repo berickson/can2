@@ -60,6 +60,14 @@ RUN groupadd -r appuser --gid 1234 && useradd --no-log-init -r -g appuser --uid 
 
 WORKDIR /app
 
+# vite.config.ts isn't copied from the builder stage (only package.json + dist are),
+# so `vite preview` runs with zero config by default -- which means Vite 6's Host
+# header allowlist (a DNS-rebinding protection) rejects any hostname other than
+# localhost. This is a private LAN dev/streaming tool with no auth of its own, so
+# disabling that check entirely (rather than enumerating specific hostnames) is the
+# right tradeoff for "reachable from any host on the LAN."
+RUN printf "import { defineConfig } from 'vite'\n\nexport default defineConfig({\n  preview: {\n    allowedHosts: true,\n  },\n})\n" > vite.config.ts
+
 COPY --from=builder --chmod=755 /app/web-viewer/package.json ./
 
 RUN echo '@nvidia:registry=https://edge.urm.nvidia.com/artifactory/api/npm/omniverse-client-npm/' >> /root/.npmrc \
