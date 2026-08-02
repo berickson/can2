@@ -96,6 +96,10 @@ services:
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     volumes:
       - ${LYRICAL_WS:-../white_crash_ws}:/workspace:rw
+    devices:
+      # 8BitDo controller (or any joystick), for joy_node -- host device, so this
+      # must be a real /dev bind, not something network_mode: host provides for free.
+      - /dev/input:/dev/input
     working_dir: /workspace
     command: ["sleep", "infinity"]
     restart: unless-stopped
