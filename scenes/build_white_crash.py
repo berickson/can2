@@ -5,10 +5,10 @@
 # Editor and run (or open scenes/build_white_crash.py directly, since training/ isn't
 # mounted into the container).
 #
-# Physical values are from real measurements (training/PLAN.md), except chassis
-# length/width/height, which are a rough placeholder -- exact chassis shape doesn't
-# matter for physics as long as mass/CoM/inertia are right, and visuals are meant to
-# be ugly for now (real OnShape CAD import is a later step).
+# Physical values are from real measurements (training/PLAN.md). Chassis is still a
+# plain box (real OnShape CAD import is a later step), but its dims are now measured
+# too, not a placeholder -- exact shape still doesn't matter for physics as long as
+# mass/CoM/inertia are right, and visuals are meant to be ugly for now.
 #
 # Track/wheel approximation matches training/PLAN.md's "Track/wheel modeling" section:
 # 2 real end wheels (rigid, no suspension) + 3 driven filler wheels per side on a
@@ -88,17 +88,24 @@ if stage.GetPrimAtPath(root_path).IsValid():
     stage.RemovePrim(root_path)
 
 # --- Chassis ---
-# Placeholder box dims -- real chassis length/height not measured yet.
-chassis_length = 0.19
-chassis_width = 0.16
-chassis_height = 0.06
+# Measured 2026-08-02 (calipers against the real chassis box).
+chassis_length = 0.165
+chassis_width = 0.14
+chassis_height = 0.045
 chassis_mass = 1.315  # kg, measured
 chassis_com = Gf.Vec3f(0.02, 0, 0)  # 20mm forward of geometric center, measured
 
 # Needed here (not just in the wheel section below) to place the chassis at a
 # starting height where the wheels rest ON the ground rather than through it.
-wheel_radius = 0.0365  # 29.5mm wheel + 7mm tread thickness
-wheel_z_offset = 0.0  # placeholder chassis assumes the wheel is centered vertically
+wheel_radius = 0.0375  # 75mm tracked-wheel diameter, measured 2026-08-02
+
+# The track pokes past the chassis box asymmetrically (5mm above the top, 20mm below
+# the bottom, measured 2026-08-02) -- unlike the old placeholder, the wheel center is
+# NOT at the chassis's vertical center anymore. Back-computed from the two overhangs
+# (top: -10mm, bottom: -5mm) and split the ~5mm difference between them (measurement
+# rounding, not a real asymmetry) -- re-measure directly if this ever matters more
+# precisely than it does for a first-pass visual/physics model.
+wheel_z_offset = -0.0075
 
 chassis_xform = UsdGeom.Xform.Define(stage, root_path)
 # Deliberately NOT an articulation (no ArticulationRootAPI): PxGearJoint is a
@@ -109,9 +116,8 @@ chassis_xform = UsdGeom.Xform.Define(stage, root_path)
 # actually designed for.
 # Small clearance above the wheel-bottom height so wheels don't start exactly
 # touching the ground (avoids initial-contact jitter/penetration at frame 0). Wheel
-# bottom sits at (wheel_z_offset - wheel_radius) in chassis-local z; wheel_z_offset
-# is 0 for now (placeholder), but computing it this way rather than just
-# wheel_radius keeps this correct once a real, non-centered wheel offset is measured.
+# bottom sits at (wheel_z_offset - wheel_radius) in chassis-local z, so the chassis
+# origin needs to start at the negation of that, not just wheel_radius.
 # XY offset (-3, 0) clears Simple_Room's table_low prop, which sits at the room's
 # origin (x:[-1.6,1.6], y:[-0.8,0.8], measured 2026-08-02) -- spawning at (0,0) would
 # land the chassis on top of it instead of on the floor.
