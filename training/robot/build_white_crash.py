@@ -1,5 +1,9 @@
-# Builds a first-pass white-crash chassis + skid-steer track approximation directly
-# into the currently-open Isaac Sim stage. Paste into Script Editor and run.
+# Self-contained, self-healing build for white-crash: room + chassis + skid-steer
+# track approximation + sensor markers + chase camera + joystick teleop, all in one
+# script. Deletes and rebuilds its own prims every run, so it's always safe to just
+# re-run this after any change -- no separate scripts needed. Paste into Script
+# Editor and run (or open scenes/build_white_crash.py directly, since training/ isn't
+# mounted into the container).
 #
 # Physical values are from real measurements (training/PLAN.md), except chassis
 # length/width/height, which are a rough placeholder -- exact chassis shape doesn't
@@ -13,25 +17,74 @@
 # measured ~1cm center deflection. All wheels driven at the same rate (one continuous
 # belt, not independent idlers). Self-collision disabled within the wheel row via a
 # CollisionGroup, since the wheels sit close together approximating one surface.
+#
+# Driving: motor_model.py's blended throttle/drag-brake model, fed from a joystick
+# (8BitDo Pro 3 -> /joy via joy_node in the lyrical container -> rclpy, subscribed
+# directly here). motor_model.py is inlined since training/ isn't mounted into the
+# container -- same logic as training/motor_model.py, kept in sync by hand.
 
+import time
 import omni.usd
+import omni.kit.app
+import omni.timeline
+import rclpy
+from sensor_msgs.msg import Joy
 from pxr import Usd, UsdGeom, UsdPhysics, PhysxSchema, Sdf, Gf
 from isaacsim.core.experimental.utils import stage as stage_utils
 from isaacsim.storage.native import get_assets_root_path
+from isaacsim.core.experimental.prims import RigidPrim
 
 stage = omni.usd.get_context().get_stage()
 
+# Clean up subscriptions/nodes left over from earlier, differently-named scratch
+# scripts run in this same Kit session (this script's own update subscription and
+# rclpy node are self-healing on repeat runs since they keep consistent names below,
+# but anything from before that naming existed -- e.g. old on_update/joy_teleop_sub/
+# motor_test_sub/joy_debug_sub from prior scenes/immediate.py iterations -- would
+# otherwise sit there forever, still firing every frame alongside this one, since
+# reassigning a differently-named global doesn't garbage-collect a different name).
+for _legacy_name in ("motor_test_sub", "joy_debug_sub", "joy_teleop_sub", "joy_node"):
+    if _legacy_name in globals():
+        _legacy_obj = globals().pop(_legacy_name)
+        destroy_node = getattr(_legacy_obj, "destroy_node", None)
+        if destroy_node:
+            try:
+                destroy_node()
+            except Exception:
+                pass
+
+# Stop the timeline before any destructive prim surgery below -- PhysX explicitly
+# warns that removing a CollisionGroup (or other physics prims) while playing is
+# undefined behavior, and this bit us directly (2026-08-02) TWICE: timeline.stop()
+# is asynchronous (only takes effect on the next app update tick), so deleting prims
+# immediately afterward was still racing PhysX's simulation actually being live --
+# pump a few app updates so the stop has actually landed before touching anything.
+timeline = omni.timeline.get_timeline_interface()
+if timeline.is_playing():
+    timeline.stop()
+    for _ in range(5):
+        omni.kit.app.get_app().update()
+
+# --- Ground: always delete + recreate, so a stale/wrong environment never lingers ---
 ground_path = "/World/ground"
-if not stage.GetPrimAtPath(ground_path).IsValid():
-    assets_root_path = get_assets_root_path()
-    stage_utils.add_reference_to_stage(
-        usd_path=assets_root_path + "/Isaac/Environments/Grid/default_environment.usd",
-        path=ground_path,
-    )
+if stage.GetPrimAtPath(ground_path).IsValid():
+    stage.RemovePrim(ground_path)
+assets_root_path = get_assets_root_path()
+ground_prim = stage_utils.add_reference_to_stage(
+    usd_path=assets_root_path + "/Isaac/Environments/Simple_Room/simple_room.usd",
+    path=ground_path,
+)
+# Unlike Grid (floor at z=0, what the chassis spawn height below assumes), this room
+# needs a shift so its floor lands at z=0. First attempt (0.8154) used a bbox on a
+# prim named "Floor" -- wrong one: the room's real physics floor is a separate
+# infinite /World/ground/GroundPlane/CollisionPlane (bbox is unbounded, can't read
+# its height from a bbox at all), which sits ~5cm higher. Recalibrated empirically
+# 2026-08-02 by watching where the chassis actually settles after Play, not by
+# picking a prim by name and hoping it's the collision surface.
+UsdGeom.Xformable(ground_prim).AddTranslateOp().Set(Gf.Vec3f(0, 0, 0.7661))
 
 root_path = "/World/WhiteCrash"
-existing_prim = stage.GetPrimAtPath(root_path)
-if existing_prim.IsValid():
+if stage.GetPrimAtPath(root_path).IsValid():
     stage.RemovePrim(root_path)
 
 # --- Chassis ---
@@ -45,6 +98,7 @@ chassis_com = Gf.Vec3f(0.02, 0, 0)  # 20mm forward of geometric center, measured
 # Needed here (not just in the wheel section below) to place the chassis at a
 # starting height where the wheels rest ON the ground rather than through it.
 wheel_radius = 0.0365  # 29.5mm wheel + 7mm tread thickness
+wheel_z_offset = 0.0  # placeholder chassis assumes the wheel is centered vertically
 
 chassis_xform = UsdGeom.Xform.Define(stage, root_path)
 # Deliberately NOT an articulation (no ArticulationRootAPI): PxGearJoint is a
@@ -53,9 +107,17 @@ chassis_xform = UsdGeom.Xform.Define(stage, root_path)
 # NVIDIA forum reports of exactly this symptom) -- not a config mistake on our end.
 # Plain maximal-coordinate rigid-body-and-joint simulation is what gear joints are
 # actually designed for.
-# Small clearance above wheel_radius so wheels don't start exactly touching the
-# ground (avoids initial-contact jitter/penetration at frame 0).
-chassis_xform.AddTranslateOp().Set(Gf.Vec3f(0, 0, wheel_radius + 0.002))
+# Small clearance above the wheel-bottom height so wheels don't start exactly
+# touching the ground (avoids initial-contact jitter/penetration at frame 0). Wheel
+# bottom sits at (wheel_z_offset - wheel_radius) in chassis-local z; wheel_z_offset
+# is 0 for now (placeholder), but computing it this way rather than just
+# wheel_radius keeps this correct once a real, non-centered wheel offset is measured.
+# XY offset (-3, 0) clears Simple_Room's table_low prop, which sits at the room's
+# origin (x:[-1.6,1.6], y:[-0.8,0.8], measured 2026-08-02) -- spawning at (0,0) would
+# land the chassis on top of it instead of on the floor.
+spawn_xy = Gf.Vec2f(-3.0, 0.0)
+spawn_z = wheel_radius - wheel_z_offset + 0.002
+chassis_xform.AddTranslateOp().Set(Gf.Vec3f(spawn_xy[0], spawn_xy[1], spawn_z))
 
 chassis_geom = UsdGeom.Cube.Define(stage, root_path + "/ChassisGeom")
 chassis_geom.CreateSizeAttr(1.0)
@@ -99,12 +161,12 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
     if is_end_wheel:
         joint_parent_path = root_path
         wheel_body_path = "%s/%s" % (root_path, wheel_name)
-        joint_local_pos0 = Gf.Vec3f(x_pos, side_y, 0)
+        joint_local_pos0 = Gf.Vec3f(x_pos, side_y, wheel_z_offset)
     else:
         # Vertical suspension carrier: chassis -> prismatic (limited, no spring) -> carrier -> wheel
         carrier_path = "%s/%s_carrier" % (root_path, wheel_name)
         carrier_xform = UsdGeom.Xform.Define(stage, carrier_path)
-        carrier_xform.AddTranslateOp().Set(Gf.Vec3f(x_pos, side_y, 0))
+        carrier_xform.AddTranslateOp().Set(Gf.Vec3f(x_pos, side_y, wheel_z_offset))
         UsdPhysics.RigidBodyAPI.Apply(carrier_xform.GetPrim())
         carrier_mass_api = UsdPhysics.MassAPI.Apply(carrier_xform.GetPrim())
         carrier_mass_api.CreateMassAttr(0.01)
@@ -114,7 +176,7 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
         prismatic.CreateBody0Rel().SetTargets([Sdf.Path(root_path)])
         prismatic.CreateBody1Rel().SetTargets([Sdf.Path(carrier_path)])
         prismatic.CreateAxisAttr("Z")
-        prismatic.CreateLocalPos0Attr(Gf.Vec3f(x_pos, side_y, 0))
+        prismatic.CreateLocalPos0Attr(Gf.Vec3f(x_pos, side_y, wheel_z_offset))
         prismatic.CreateLocalPos1Attr(Gf.Vec3f(0, 0, 0))
         limit_api = UsdPhysics.LimitAPI.Apply(prismatic.GetPrim(), "transZ")
         limit_api.CreateLowAttr(-deflection_limit)
@@ -133,7 +195,7 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
     # (unlike filler wheels, which inherit correct position from their carrier), so
     # they need their own explicit translate or they all default to the chassis origin.
     if is_end_wheel:
-        wheel_geom.AddTranslateOp().Set(Gf.Vec3f(x_pos, side_y, 0))
+        wheel_geom.AddTranslateOp().Set(Gf.Vec3f(x_pos, side_y, wheel_z_offset))
     UsdPhysics.RigidBodyAPI.Apply(wheel_geom.GetPrim())
     UsdPhysics.CollisionAPI.Apply(wheel_geom.GetPrim())
     wheel_mass_api = UsdPhysics.MassAPI.Apply(wheel_geom.GetPrim())
@@ -154,10 +216,16 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
         # powered, the belt (which these gear joints approximate) rigidly carries
         # that motion to every other contact point, they're not just coincidentally
         # commanded to agree.
+        # Damping/stiffness are zero, not a real holding drive: driving now happens
+        # entirely via motor_model.py's open-loop torque (below), not a PhysX-level
+        # velocity drive. This DriveAPI is just a required attachment point, not an
+        # active controller -- earlier versions used a strong damping placeholder
+        # here and then had to zero it out at runtime before applying torque; simpler
+        # to just never author a fighting drive in the first place.
         drive_api = UsdPhysics.DriveAPI.Apply(revolute.GetPrim(), "angular")
         drive_api.CreateTypeAttr("velocity")
         drive_api.CreateTargetVelocityAttr(0.0)
-        drive_api.CreateDampingAttr(1.0e6)
+        drive_api.CreateDampingAttr(0.0)
         drive_api.CreateStiffnessAttr(0.0)
     else:
         # PhysxPhysicsGearJoint, not NewtonMimicAPI: PhysX is Isaac Sim's default
@@ -289,4 +357,137 @@ chase_cam_rotate_x_op.Set(90.0 - chase_cam_pitch_down_deg)
 camera.SetXformOpOrder([chase_cam_translate_op, chase_cam_rotate_z_op, chase_cam_rotate_x_op])
 camera.CreateFocalLengthAttr(18.0)  # wide-ish, so the small nearby robot isn't cropped
 
-print("Chase camera created at %s -- switch the viewport to it via the camera dropdown, or run scenes/chase_cam.py." % camera_path)
+print("Chase camera created at %s" % camera_path)
+
+import omni.kit.viewport.utility as vp_utils
+
+vp_utils.get_active_viewport().camera_path = camera_path
+print("Active viewport camera set to ChaseCam. Switch back via the viewport's camera dropdown (pick 'Perspective') if needed.")
+
+# --- Joystick teleop ---
+# 8BitDo Pro 3 -> /joy (joy_node in the lyrical container) -> per-side
+# throttle/drag_brake -> motor_model.py (inlined) -> wheel torque, applied every
+# physics step. Axis mapping confirmed empirically 2026-08-02 against this specific
+# controller + joy_node, not from any spec:
+#   axes[1] = left stick Y, forward (away from body) = +1.0 -- already matches
+#             throttle_percent's own forward-positive convention, no sign flip needed.
+#   axes[3] = right stick Y, same convention.
+#   axes[4] = R2, rest = +1.0 (not pressed), full pull = -1.0.
+#   axes[5] = L2, same convention as R2.
+#
+# Simplification: reads angular velocity in the WORLD frame and assumes it stays
+# aligned with the wheel's local spin axis (true while the robot's flat/upright, not
+# exact if it tips or turns hard) -- fine for interactive driving, not a permanent
+# design.
+
+# --- motor_model.py inlined ---
+VOLTAGE_C0 = 0.412
+VOLTAGE_C1 = 2.600
+VOLTAGE_C2 = 0.850
+COAST_C0 = 0.951
+COAST_C1 = 0.794
+BRAKE_C0 = 1.008
+BRAKE_C1 = 2.950
+CHARACTERIZATION_MASS_KG = 1.315
+DEADBAND_V = 0.01  # m/s, "close enough to at-rest" for stiction-deadband purposes
+
+
+def _signed_resistive_decel(v, c0, c1):
+    magnitude = c0 + c1 * abs(v)
+    if v > 0:
+        return -magnitude
+    if v < 0:
+        return magnitude
+    return 0.0
+
+
+def _accel_from_throttle(throttle_percent, v, v_bat):
+    if throttle_percent == 0:
+        return _signed_resistive_decel(v, COAST_C0, COAST_C1)
+    v_motor = throttle_percent * v_bat
+    a = (v_motor - VOLTAGE_C0 - VOLTAGE_C1 * v) / VOLTAGE_C2
+    if abs(v) < DEADBAND_V and a * throttle_percent < 0:
+        a = 0.0
+    return a
+
+
+def _accel_from_drag_brake(v):
+    return _signed_resistive_decel(v, BRAKE_C0, BRAKE_C1)
+
+
+def motor_model(throttle_percent, drag_brake_percent, omega_current, v_bat, radius):
+    v = omega_current * radius
+    a_throttle = _accel_from_throttle(throttle_percent, v, v_bat)
+    a_brake = _accel_from_drag_brake(v)
+    a = (1 - drag_brake_percent) * a_throttle + drag_brake_percent * a_brake
+    force = CHARACTERIZATION_MASS_KG * a
+    torque = force * radius
+    return torque
+
+
+left_wheel = RigidPrim(root_path + "/left_wheel_front")
+right_wheel = RigidPrim(root_path + "/right_wheel_front")
+
+V_BAT = 7.4  # adjust to match the real battery's nominal voltage
+
+# Self-healing: destroy any previous run's rclpy node before creating a new one,
+# rather than leaking one every time this script is re-run in the same Kit session.
+if "_white_crash_joy_node" in globals():
+    try:
+        _white_crash_joy_node.destroy_node()
+    except Exception:
+        pass
+
+if not rclpy.ok():
+    rclpy.init()
+
+_white_crash_joy_node = rclpy.create_node("isaac_joy_teleop")
+_white_crash_joy_axes = [0.0] * 8
+
+
+def _on_joy(msg):
+    global _white_crash_joy_axes
+    _white_crash_joy_axes = msg.axes
+
+
+_white_crash_joy_sub = _white_crash_joy_node.create_subscription(Joy, "/joy", _on_joy, 10)
+
+
+def _drag_brake_from_trigger(axis_value):
+    # rest = +1.0 -> 0.0 brake, full pull = -1.0 -> 1.0 brake
+    return max(0.0, min(1.0, (1.0 - axis_value) / 2.0))
+
+
+_last_debug_print = [0.0]
+
+
+def _on_update(e):
+    rclpy.spin_once(_white_crash_joy_node, timeout_sec=0)
+    axes = _white_crash_joy_axes
+    left_throttle = axes[1]
+    right_throttle = axes[3]
+    left_drag_brake = _drag_brake_from_trigger(axes[5])
+    right_drag_brake = _drag_brake_from_trigger(axes[4])
+
+    do_print = False
+    now = time.time()
+    if now - _last_debug_print[0] > 0.3:
+        _last_debug_print[0] = now
+        do_print = True
+
+    for name, wheel, throttle, drag_brake in (
+        ("L", left_wheel, left_throttle, left_drag_brake),
+        ("R", right_wheel, right_throttle, right_drag_brake),
+    ):
+        _, angular_velocities = wheel.get_velocities()
+        omega_y = float(angular_velocities.numpy()[0][1])
+        v = omega_y * wheel_radius
+        torque = motor_model(throttle, drag_brake, omega_y, V_BAT, wheel_radius)
+        wheel.apply_forces_and_torques_at_pos(torques=[[0.0, torque, 0.0]], local_frame=True)
+        if do_print:
+            print("%s throttle=%.2f brake=%.2f v=%.3f m/s omega=%.2f rad/s torque=%.4f N*m" % (
+                name, throttle, drag_brake, v, omega_y, torque))
+
+
+_white_crash_joy_teleop_sub = omni.kit.app.get_app().get_update_event_stream().create_subscription_to_pop(_on_update)
+print("Joystick teleop running -- left/right stick = throttle, L2/R2 = drag brake. Press Play.")
