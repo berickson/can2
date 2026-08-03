@@ -10,9 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN echo "source /opt/ros/lyrical/setup.bash" >> /etc/bash.bashrc
 
 # Replaces the base image's ros_entrypoint.sh (same env setup) and additionally
-# starts joy_node under a respawn loop -- see entrypoint.sh for why.
+# starts joy_node under a respawn loop plus a staleness watchdog -- see
+# entrypoint.sh and joy_watchdog.py for why.
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY joy_watchdog.py /joy_watchdog.py
+RUN chmod +x /entrypoint.sh /joy_watchdog.py
 ENTRYPOINT ["/entrypoint.sh"]
 
 WORKDIR /workspace
