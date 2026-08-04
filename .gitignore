@@ -8,3 +8,6 @@ docker/.env
 white_crash_ws/build/
 white_crash_ws/install/
 white_crash_ws/log/
+
+# Python bytecode cache
+__pycache__/
