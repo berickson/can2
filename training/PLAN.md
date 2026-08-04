@@ -150,6 +150,117 @@ wouldn't drag the driven wheel down too). What actually works, built at
   no real analog for — bigger rework than was justified once the plain-gear-joint
   route (without articulation) turned out to actually work.
 
+### Drivetrain debugging (2026-08-03) — six real bugs, table foot still open
+
+Started from "the real robot climbs a short table-foot ramp easily, the sim robot
+can't, even at absurd torque multipliers." That specific question is **still
+unresolved**, but chasing it uncovered six genuine bugs, several of which were
+actively producing the misleading evidence the investigation was reasoning from.
+Script under test: `training/robot/build_white_crash.py`, mirrored to
+`scenes/build_white_crash.py` — `training/` isn't mounted into the container, so
+the `scenes/` copy is what Isaac Sim actually runs. **Keep both in sync by hand;
+`cp` after every edit.**
+
+**Read this before re-opening the climbing question:** most measurements taken
+during this session were contaminated by one or more of the bugs below, so
+conclusions like "no amount of torque moves it" and "this is a hard kinematic
+lock" were measuring artifacts, not the robot. Re-measure before trusting any of
+it.
+
+Bugs found and fixed, roughly in the order they were masking each other:
+
+1. **`maxAngularVelocity` is in DEGREES per second, not radians.** The single
+   highest-impact find. An earlier fix in this same session set it to `1000.0`
+   intending 1000 rad/s; that is 1000 deg/s = 17.45 rad/s, which at this wheel
+   radius is a hard 0.65 m/s speed ceiling. Measured live at 17.36 rad/s in a
+   torque sweep, with wheels rolling slip-free while applied torque was swept
+   0.01 → 100 N·m with no effect above ~0.1 N·m. The giveaway for the units is
+   PhysX's own default, 5729.578, which is exactly 100 rad/s written in degrees.
+   This one clamp invalidated the `V_BAT`-to-1000V test, every
+   `TORQUE_MULTIPLIER` sweep, and the `throttle * 100.0` experiment — all of them
+   were measuring the clamp.
+2. **Wheel spin measurement was wrong twice, in different ways.** First a naive
+   world-frame-Y read, only correct at zero chassis yaw, under-reporting a real
+   ~0.5 rad/s spin as 0.02. Replaced by `_wheel_spin_rate()`, which differences
+   the wheel's own orientation quaternion and projects onto its live spin axis.
+   Then, in the sweep diagnostic, aliasing: quaternion differencing resolves at
+   most one revolution per sample, so sampling every 0.5 s capped readings at
+   2π/0.5 = 12.57 rad/s and produced random sign flips that looked like physical
+   oscillation. Sample every frame, not per print.
+3. **Invalid inertia tensor.** Raising only the spin term while leaving the
+   geometric transverse term gave principal moments violating the triangle
+   inequality (I₁ + I₂ ≥ I₃). PhysX accepted it silently and then flung the
+   wheels off the chassis. Now set isotropically.
+4. **Resistive torque could reverse the wheel in one step**, then oscillate with
+   growing amplitude — wheels thrashing violently with no joystick input. Coast
+   resistance (~0.047 N·m) against a tiny wheel inertia is ~53 rad/s of change per
+   16 ms frame. Bounded by `_limit_resistive_torque` to `I*|ω|/dt`. Note the
+   follow-on bug: the first version classified "resistive" as any torque opposing
+   motion, which also caught forward throttle applied while rolling backwards,
+   creating a trap where the bound shrank with ω until forward input did nothing.
+   Classify by agreement with the throttle command (intent), not by sign against
+   velocity.
+5. **Leftover diagnostic subscriptions survived rebuilds.** The script's cleanup
+   was a hardcoded list of known names, so a subscription from a diagnostic script
+   written later in the session kept firing against deleted prims *and* kept
+   applying 50 N·m to the wheels, which read as a physics explosion in the build
+   script. Cleanup now sweeps by TYPE, so no future diagnostic can poison a
+   rebuild. Related, also fixed: the teardown must happen BEFORE prim deletion,
+   and the viewport must be moved off `ChaseCam` before that camera's parent is
+   deleted (otherwise the render surface goes permanently blank/white).
+6. **Suspension travel limits were never enforced.** `UsdPhysics.LimitAPI` with a
+   `"transZ"` instance is the generic/D6 mechanism; PhysX does not read it on a
+   `PrismaticJoint`, which has its own `lowerLimit`/`upperLimit`. The filler
+   wheels' 0.75–1 cm travel was authored but unbounded, so those six wheels could
+   wander arbitrarily far from the contact patch. Beyond the visual, this means
+   load distribution and which wheels were actually touching ground were wrong for
+   every test before this fix — plausibly including the original table-foot
+   behaviour, since a freely-sliding filler wheel cannot push back against a step.
+
+**Known-good after these fixes:** forward/reverse both work, wheels respond to
+joystick, robot drives and turns.
+
+**Still wrong / unfinished:**
+
+- **Over-powered.** Wheels break traction and spin up almost instantly. Partly
+  real (full throttle asks ~18.9 N at the contact patch against ~7.7 N of
+  available friction, so slip is correct), partly modelling: `motor_model` sizes
+  its output to accelerate the whole 1.315 kg vehicle
+  (`force = CHARACTERIZATION_MASS_KG * a`) but that torque is applied to a single
+  wheel.
+- **`SPIN_INERTIA = 2e-4` is a stability guess, not a measurement.** It stands in
+  for gearbox-reflected rotor inertia (`I_rotor * N²`), which for a small heavily
+  geared robot usually dominates the wheel's own inertia. It materially affects
+  acceleration, so it must be measured or calibrated before any sim-to-real
+  conclusion rests on it. `WHEEL_INERTIA` in the teleop loop must be kept equal to
+  it — they are two constants describing one quantity.
+- **Wheel friction 0.6/0.5 is also a placeholder**, and was swung between 0.6 and
+  1.0 during the session chasing the (bogus) climbing evidence. Note the real
+  tradeoff found along the way: high isotropic friction fights skid-steer turning,
+  since a tank turn needs the tracks to slip sideways and PhysX has no
+  directional/anisotropic friction here.
+- **The table foot itself is untested since the fixes.** Retest from a clean
+  restart before theorising. The most useful single experiment is still
+  `scenes/diagnose_wheel_force.py` in torque mode *with the robot wedged against
+  the foot* rather than on open ground — it bypasses joystick, motor model, and
+  gear coupling entirely.
+
+**Diagnostic scripts** (all in `scenes/`, all runnable from Script Editor):
+`diagnose_wheel_force.py` (raw force/torque straight to one wheel),
+`diagnose_torque_sweep.py` (automated torque sweep with per-frame telemetry),
+`diagnose_wheel_damping.py` (dumps live joint/rigid-body attributes),
+`diagnose_torque_delivery.py` (read/write ordering A/B),
+`diagnose_zombie_subs.py` (finds leftover subscriptions),
+`diagnose_gear_joints.py` (gear joint wiring).
+
+**Practical note:** Script Editor `print()` output and tracebacks are mirrored into
+the Kit log at
+`/home/brian/docker/isaac-sim/logs/Kit/Isaac-Sim Streaming/6.0/kit_<timestamp>.log`
+(tagged `[py stdout]` / `[py stderr]`), so diagnostics can be read directly from
+the log instead of screenshotted. The file is per-session — a Kit restart starts a
+new one, so pick the newest. Note also that File → New Stage does NOT reset the
+Script Editor's Python namespace; only a full application restart does.
+
 ## Key design decisions made so far
 
 - **Geometry stays classical, dynamics get learned.** Convert the 3 raw lidar readings
