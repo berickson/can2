@@ -127,7 +127,15 @@ if stage.GetPrimAtPath(root_path).IsValid():
 chassis_length = 0.165
 chassis_width = 0.14
 chassis_height = 0.045
-chassis_mass = 1.315  # kg, measured
+# 1.315 kg is the measured mass of the WHOLE robot, wheels included, so it can't
+# also be the chassis body's mass -- 10 wheels and 6 carriers get their own mass
+# below, and assigning the full figure here made the sim robot 1.575 kg, ~20%
+# heavier than the real one, which skews every acceleration and traction result.
+# Chassis carries the remainder.
+ROBOT_TOTAL_MASS = 1.315  # kg, measured whole-robot (training/PLAN.md)
+WHEEL_MASS = 0.02         # kg each, 10 of them
+CARRIER_MASS = 0.01       # kg each, 6 of them (3 filler carriers per side)
+chassis_mass = ROBOT_TOTAL_MASS - (10 * WHEEL_MASS) - (6 * CARRIER_MASS)
 chassis_com = Gf.Vec3f(0.02, 0, 0)  # 20mm forward of geometric center, measured
 
 # Needed here (not just in the wheel section below) to place the chassis at a
@@ -217,8 +225,14 @@ ENABLE_TRACK_ENVELOPE = False
 wheel_material_path = root_path + "/WheelMaterial"
 wheel_material_shade = UsdShade.Material.Define(stage, wheel_material_path)
 wheel_material = UsdPhysics.MaterialAPI.Apply(wheel_material_shade.GetPrim())
-wheel_material.CreateStaticFrictionAttr(0.6)
-wheel_material.CreateDynamicFrictionAttr(0.5)
+# PLA tracks on a wood floor (confirmed with the user 2026-08-04), not the rubber-
+# on-hard-floor guess this started as. Dry PLA on wood is genuinely low-grip,
+# ~0.3-0.4, giving a traction ceiling of only ~3.0-3.9 m/s^2. That means real
+# wheelspin under hard throttle is CORRECT behaviour for this robot, not a bug --
+# the motor model asks for 14.3 m/s^2 at full throttle, roughly 4x what these
+# tracks can put down.
+wheel_material.CreateStaticFrictionAttr(0.35)
+wheel_material.CreateDynamicFrictionAttr(0.30)
 
 
 def bind_wheel_material(prim):
@@ -252,7 +266,7 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
         carrier_xform.AddTranslateOp().Set(Gf.Vec3f(x_pos, side_y, wheel_z_offset))
         UsdPhysics.RigidBodyAPI.Apply(carrier_xform.GetPrim())
         carrier_mass_api = UsdPhysics.MassAPI.Apply(carrier_xform.GetPrim())
-        carrier_mass_api.CreateMassAttr(0.01)
+        carrier_mass_api.CreateMassAttr(CARRIER_MASS)
 
         prismatic_path = "%s_suspension" % carrier_path
         prismatic = UsdPhysics.PrismaticJoint.Define(stage, prismatic_path)
@@ -313,7 +327,7 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
     UsdPhysics.CollisionAPI.Apply(wheel_geom.GetPrim())
     bind_wheel_material(wheel_geom.GetPrim())
     wheel_mass_api = UsdPhysics.MassAPI.Apply(wheel_geom.GetPrim())
-    wheel_mass_api.CreateMassAttr(0.02)
+    wheel_mass_api.CreateMassAttr(WHEEL_MASS)
     # Explicit rotational inertia, NOT the geometric value PhysX would derive.
     #
     # A bare 0.02kg cylinder has spin inertia 0.5*m*r^2 = 1.4e-5 kg*m^2 -- about
@@ -325,16 +339,27 @@ def create_wheel(side_name, side_y, x_pos, is_end_wheel, deflection_limit, name_
     # 2026-08-03, wheels reached +-60 rad/s with only 0.0003 N*m applied, which
     # is the solver injecting energy, not anything the control loop did.
     #
-    # Physically the right correction rather than a fudge: these wheels are
-    # driven through a gearbox, so they carry the motor rotor's REFLECTED
-    # inertia, I_rotor * N^2, which for a small heavily-geared robot typically
-    # dominates the wheel's own inertia. That adds rotational inertia without
-    # adding translational mass, which is exactly what the solver needs.
-    # SPIN_INERTIA is the tunable knob here -- at 2e-4 across 10 wheels the
-    # drivetrain contributes sum(I)/r^2 ~= 1.4kg of apparent mass, comparable to
-    # the robot's own 1.315kg, which is a reasonable regime for a geared tracked
-    # vehicle. Raise it if the solver still misbehaves, lower it if the robot
-    # feels sluggish to spin up. Not measured against the real robot yet.
+    # HONEST LABEL: this is a solver-stability crutch, not a physical value.
+    #
+    # It was originally justified as gearbox-reflected rotor inertia, I_rotor *
+    # N^2. That rationale is void -- the real robot is DIRECT DRIVE, 1:1 motor to
+    # wheel (confirmed with the user 2026-08-04), so there is no gear ratio to
+    # amplify anything. Physically realistic total is the wheel plus a bare rotor,
+    # order 2e-5 kg*m^2; 2e-4 is roughly 10x that.
+    #
+    # It is kept high anyway because the maximal-coordinate solver could not
+    # converge at the true value: 5 gear-coupled wheels per side against a much
+    # heavier chassis had wheels reaching +-60 rad/s on 0.0003 N*m of applied
+    # torque, which is the solver manufacturing energy. DRIVE_TORQUE_SCALE
+    # compensates for the inflated inertia so flat-ground acceleration still
+    # matches the characterized model, but the inflation is NOT free: it makes the
+    # wheels harder to spin up or stall than they really are, which distorts
+    # exactly the slip-limited manoeuvres (climbing, scrub turns) this sim exists
+    # to get right.
+    #
+    # Worth retrying at ~5e-5 now that several genuine instability sources are
+    # fixed (unbounded suspension travel, invalid inertia tensor, 20% mass error).
+    # If it holds together, prefer the lower value.
     SPIN_INERTIA = 2.0e-4
     # Set ISOTROPICALLY, and that is deliberate. A rigid body's principal moments
     # must satisfy the triangle inequality I1 + I2 >= I3 in every permutation. A
@@ -718,6 +743,43 @@ _last_update_time = [0.0]
 # resistive torque below, and if the two disagree the bound is simply wrong.
 WHEEL_INERTIA = 2.0e-4
 
+# --- Drive force accounting ---
+# motor_model returns force = CHARACTERIZATION_MASS_KG * a, i.e. the force needed
+# to accelerate the WHOLE vehicle at the characterized acceleration `a`, expressed
+# as a torque at one wheel. Two corrections are needed before that can be handed
+# to a wheel in this sim, and until 2026-08-04 neither was applied:
+#
+#   /2   That whole-vehicle force was being applied to the left AND right wheel,
+#        so the contact patches together delivered twice what the model asked for.
+#
+#   xM   The characterized `a` is the real robot's NET observed acceleration, which
+#        already includes its real drivetrain's rotational inertia. This sim has to
+#        accelerate its own translational mass PLUS its wheels' rotational inertia
+#        reflected to the ground, sum(I)/r^2 -- roughly 1.4 kg-equivalent at
+#        SPIN_INERTIA=2e-4, comparable to the robot itself. Driving that with a
+#        force sized for bare vehicle mass under-delivers by about half.
+#
+# Those two errors are near-reciprocal, which is why the sim looked approximately
+# right while both were present -- they cancelled to within ~4%. That was luck, and
+# it breaks as soon as SPIN_INERTIA moves, which is precisely the knob we need free
+# for solver stability. Making both explicit decouples the two concerns: tune
+# SPIN_INERTIA purely for stability and flat-ground acceleration still matches the
+# real characterization, by construction.
+#
+# Note this compensation only binds while the wheels have grip. Once demanded force
+# exceeds available friction the wheels slip and traction sets the limit instead,
+# which is correct and is what makes climbing/slip behaviour meaningful.
+DRIVEN_WHEEL_COUNT = 2  # torque is applied to the front wheel of each side
+_wheel_count = 10
+_carrier_count = 6
+EFFECTIVE_DRIVE_MASS = (
+    ROBOT_TOTAL_MASS + (_wheel_count * WHEEL_INERTIA) / wheel_radius ** 2)
+DRIVE_TORQUE_SCALE = EFFECTIVE_DRIVE_MASS / (CHARACTERIZATION_MASS_KG * DRIVEN_WHEEL_COUNT)
+print("[build] effective drive mass %.3f kg (vehicle %.3f + drivetrain %.3f), "
+      "per-wheel torque scale %.3f" % (
+          EFFECTIVE_DRIVE_MASS, ROBOT_TOTAL_MASS,
+          (_wheel_count * WHEEL_INERTIA) / wheel_radius ** 2, DRIVE_TORQUE_SCALE))
+
 
 def _limit_resistive_torque(torque, omega, dt, throttle):
     """Stop a COASTING/BRAKING torque from reversing the wheel within a step.
@@ -785,7 +847,8 @@ def _on_update(e):
     ):
         omega = _wheel_spin_rate(name, wheel)
         v = omega * wheel_radius
-        raw_torque = motor_model(throttle, drag_brake, omega, V_BAT, wheel_radius) * TORQUE_MULTIPLIER
+        raw_torque = (motor_model(throttle, drag_brake, omega, V_BAT, wheel_radius)
+                      * DRIVE_TORQUE_SCALE * TORQUE_MULTIPLIER)
         torque = _limit_resistive_torque(raw_torque, omega, dt, throttle)
         wheel.apply_forces_and_torques_at_pos(torques=[[0.0, torque, 0.0]], local_frame=True)
         if do_print:
