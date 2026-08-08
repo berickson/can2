@@ -96,10 +96,23 @@ services:
       - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
     volumes:
       - ${LYRICAL_WS:-../white_crash_ws}:/workspace:rw
-    devices:
       # 8BitDo controller (or any joystick), for joy_node -- host device, so this
       # must be a real /dev bind, not something network_mode: host provides for free.
+      #
+      # A VOLUME bind, deliberately not `devices:`. `devices:` enumerates the device
+      # nodes once at container-create time and grants cgroup access to exactly those
+      # major:minor pairs -- so a controller that enumerates AFTER the container
+      # started is invisible inside it forever, no matter how often joy_node
+      # restarts. Hit live 2026-08-07: container created Aug 5 saw event0-event18,
+      # while the controller had come up as event21, and /joy stayed silent with
+      # joy_node stuck in a respawn loop. A volume bind shares the directory inode,
+      # so nodes appearing later show up.
       - /dev/input:/dev/input
+    # Pairs with the bind above: major 13 is the input subsystem, and `*` pre-grants
+    # any minor, including ones that don't exist yet. Without this the node would be
+    # visible but un-openable, since the bind conveys no cgroup permission.
+    device_cgroup_rules:
+      - 'c 13:* rmw'
     working_dir: /workspace
     command: ["sleep", "infinity"]
     restart: unless-stopped
