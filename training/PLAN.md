@@ -60,6 +60,18 @@ firmware repo's README, but not yet pulled from there):
   (simple-box approximation) as a first pass, refine later if sim behavior shows it
   matters.
 
+**Top speed** (measured 2026-08-07, pack reading 12.0V):
+- **4.0 m/s on hard ground**, **4.2 m/s no-load**. First check on the voltage
+  feedforward model at the top of its range — the fit came from mid-range driving
+  trials, so full throttle was extrapolation.
+- Raw model predicts `(12.0 - 0.412)/2.6` = 4.46 m/s, ~11% high. Cause is the
+  model assuming the motor sees the *full* pack voltage; the real path loses some
+  to pack internal resistance + H-bridge + wiring. Handled by `VOLTAGE_SCALE` in
+  `motor_model.py` rather than by re-fitting the firmware-shared coefficients.
+- Not worth pinning down exactly — this is a domain-randomization target, not a
+  constant. What matters is that the *range* is right and that teleop at full
+  throttle tops out near the real 4 m/s rather than 4.5.
+
 Current hand-tuned PIDs are the baseline to beat, and per the user, "honestly aren't up
 to my own standards" — so the bar may not be that high, but the comparison should still
 be real (same track, same conditions, measured not eyeballed).

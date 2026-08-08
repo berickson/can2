@@ -28,6 +28,26 @@ COAST_C1 = 0.794
 BRAKE_C0 = 1.008
 BRAKE_C1 = 2.950
 
+# Fraction of pack voltage that actually reaches the motor. The coefficients above
+# were fit against motor voltage, but all we can command is throttle * pack voltage
+# -- and the real path loses some of it to pack internal resistance, the DRV8833's
+# Rds(on), and wiring. Measured top speeds (2026-08-07, pack reading 12.6V nominal /
+# 12.0V at the time) were 4.0 m/s on hard ground and 4.2 m/s no-load, against a raw
+# model prediction of 4.46 m/s -- about 11% high, which 0.90 here brings back in line.
+#
+# A fixed voltage subtraction would be the more literal model of a resistive drop,
+# but it has the wrong shape: it would zero out low throttle entirely (0.1 * 12V is
+# less than the drop) when in reality low throttle draws little current and loses
+# little voltage. A scale factor goes to zero with throttle, which is closer.
+#
+# Not a precisely-determined number -- pinning it down would take top-speed runs at
+# two logged pack voltages, and it isn't worth it. This is a domain-randomization
+# target (the "motor gain" knob in PLAN.md's DR list); ~0.82-1.0 is a reasonable
+# range, covering roughly 3.6-4.5 m/s top speed at 12V before pack voltage itself is
+# randomized. The default is set to match the real robot so manual teleop in the sim
+# feels like driving the actual thing.
+VOLTAGE_SCALE = 0.90
+
 # Below this speed the wheel is treated as "at rest" for deadband purposes -- not a
 # measured constant, just a small epsilon.
 DEADBAND_V = 0.01  # m/s
@@ -63,7 +83,7 @@ def _accel_from_throttle(throttle_percent, v, v_bat):
         # actively working to resist motion.
         return _signed_resistive_decel(v, COAST_C0, COAST_C1)
 
-    v_motor = throttle_percent * v_bat
+    v_motor = throttle_percent * v_bat * VOLTAGE_SCALE
     a = (v_motor - VOLTAGE_C0 - VOLTAGE_C1 * v) / VOLTAGE_C2
     # VOLTAGE_C0 is the voltage needed to overcome friction and actually move the
     # wheel, fit from trials where the wheel was already turning (kinetic
